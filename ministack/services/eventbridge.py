@@ -3156,14 +3156,17 @@ def _create_archive(data):
         "ArchiveName": name,
         "ArchiveArn": arn,
         "EventSourceArn": source_arn,
-        "Description": data.get("Description", ""),
-        "EventPattern": data.get("EventPattern", ""),
         "RetentionDays": data.get("RetentionDays", 0),
         "State": "ENABLED",
         "CreationTime": _now_ts(),
         "EventCount": 0,
         "SizeBytes": 0,
     }
+    # An archive created without a description or a pattern has neither in
+    # DescribeArchive.
+    for key in ("Description", "EventPattern"):
+        if key in data:
+            _archives[name][key] = data[key]
     # Unlike event buses, an empty identifier is not stored: an archive with no
     # customer managed key has no KmsKeyIdentifier in DescribeArchive.
     if data.get("KmsKeyIdentifier"):

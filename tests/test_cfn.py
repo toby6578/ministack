@@ -17593,6 +17593,272 @@ def test_cfn_logs_metric_filter_provisions(cfn, logs):
         _delete_cfn_test_stack(cfn, stack_name)
 
 
+_LONG_ARCHIVE_ID = "GeneratedArchiveWithAVeryLongLogicalIdentifierForTruncationAbc"
+
+
+def _cfn_archive_template(uid, named_props, generated_bus="Bus", outputs=None):
+    return json.dumps({
+        "Resources": {
+            "Bus": {"Type": "AWS::Events::EventBus", "Properties": {"Name": f"cfn-archive-bus-{uid}"}},
+            "Bus2": {"Type": "AWS::Events::EventBus", "Properties": {"Name": f"cfn-archive-bus2-{uid}"}},
+            "Named": {"Type": "AWS::Events::Archive", "Properties": {
+                "SourceArn": {"Fn::GetAtt": ["Bus", "Arn"]}, **named_props}},
+            "Unnamed": {"Type": "AWS::Events::Archive", "Properties": {
+                "SourceArn": {"Fn::GetAtt": [generated_bus, "Arn"]}}},
+        },
+        "Outputs": outputs or {
+            "NamedRef": {"Value": {"Ref": "Named"}},
+            "NamedArn": {"Value": {"Fn::GetAtt": ["Named", "Arn"]}},
+            "UnnamedRef": {"Value": {"Ref": "Unnamed"}},
+        },
+    })
+
+
+def _cfn_archive_props(uid, name=None, description="v1", retention=3, sources=("app.orders",)):
+    return {"ArchiveName": name or f"cfn-archive-{uid}", "Description": description,
+            "RetentionDays": retention, "EventPattern": {"source": list(sources)}}
+
+
+def _describe_archive(eb, name):
+    return {k: v for k, v in eb.describe_archive(ArchiveName=name).items() if k != "ResponseMetadata"}
+
+
+def _stack_failure_reasons(cfn, stack_name):
+    return [e.get("ResourceStatusReason") or ""
+            for e in cfn.describe_stack_events(StackName=stack_name)["StackEvents"]]
+
+
+def test_cfn_events_archive_provisions(cfn, eb):
+    """Ref is the archive name, and a generated one is the logical id, - and 12
+    letters and digits. The pattern is stored compact, an archive created
+    without a description or a pattern has neither, and a stack delete removes
+    the archives."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        named = f"cfn-archive-{uid}"
+        assert _output(stack, "NamedRef") == named
+        assert _output(stack, "NamedArn").endswith(f":archive/{named}")
+        unnamed = _output(stack, "UnnamedRef")
+        assert re.fullmatch(r"Unnamed-[A-Za-z0-9]{12}", unnamed)
+
+        bus_arn = eb.describe_event_bus(Name=f"cfn-archive-bus-{uid}")["Arn"]
+        archive = _describe_archive(eb, named)
+        assert {k: archive[k] for k in ("EventSourceArn", "Description", "EventPattern", "RetentionDays")} == {
+            "EventSourceArn": bus_arn, "Description": "v1",
+            "EventPattern": '{"source":["app.orders"]}', "RetentionDays": 3}
+        generated = _describe_archive(eb, unnamed)
+        assert "Description" not in generated and "EventPattern" not in generated
+        assert generated["RetentionDays"] == 0
+        assert generated["EventSourceArn"] == bus_arn
+
+        cfn.delete_stack(StackName=stack_name)
+        _wait_stack(cfn, stack_name)
+        left = {a["ArchiveName"] for a in eb.list_archives()["Archives"]}
+        assert named not in left and unnamed not in left
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_generated_name_fits_the_limit(cfn, eb):
+    """A long logical id is cut to 35 characters, so the generated name is 48,
+    the API's limit. A pattern keeps non-ASCII characters as written."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-long-{uid}"
+    body = json.loads(_cfn_archive_template(uid, {
+        **_cfn_archive_props(uid),
+        "EventPattern": {"source": ["app.orders"], "detail-type": ["caf\u00e9 order"]}}))
+    body["Resources"][_LONG_ARCHIVE_ID] = body["Resources"].pop("Unnamed")
+    body["Outputs"]["UnnamedRef"] = {"Value": {"Ref": _LONG_ARCHIVE_ID}}
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(body))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        generated = _output(stack, "UnnamedRef")
+        assert re.fullmatch(rf"{_LONG_ARCHIVE_ID[:35]}-[A-Za-z0-9]{{12}}", generated)
+        assert len(generated) == 48
+        stored = _describe_archive(eb, f"cfn-archive-{uid}")["EventPattern"]
+        assert json.loads(stored) == {"source": ["app.orders"], "detail-type": ["caf\u00e9 order"]}
+        assert "caf\u00e9" in stored and ", " not in stored and ": " not in stored
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_string_pattern_is_refused(cfn, eb):
+    """EventPattern is a pattern object; a string is not one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-str-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(
+        uid, {**_cfn_archive_props(uid), "EventPattern": '{"source": ["app.orders"]}'}))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert f"cfn-archive-{uid}" not in {a["ArchiveName"] for a in eb.list_archives()["Archives"]}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_getatt_archive_name_rolls_back(cfn, eb):
+    """ArchiveName is a property of the schema but not a read-only one, so
+    Fn::GetAtt cannot read it."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-attr-{uid}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(
+        uid, _cfn_archive_props(uid),
+        outputs={"NamedName": {"Value": {"Fn::GetAtt": ["Named", "ArchiveName"]}}}))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "ROLLBACK_COMPLETE"
+        assert any("Requested attribute ArchiveName must be a readonly property in schema "
+                   "for AWS::Events::Archive" in reason
+                   for reason in _stack_failure_reasons(cfn, stack_name))
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_updates_in_place(cfn, eb):
+    """Description, RetentionDays and EventPattern change on the existing
+    archive, which keeps its name and creation time."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-upd-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        named = f"cfn-archive-{uid}"
+        created = _describe_archive(eb, named)["CreationTime"]
+
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(
+            uid, _cfn_archive_props(uid, description="v2", retention=7,
+                                    sources=("app.orders", "app.invoices"))))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "NamedRef") == named
+        archive = _describe_archive(eb, named)
+        assert archive["CreationTime"] == created
+        assert (archive["Description"], archive["RetentionDays"], archive["EventPattern"]) == (
+            "v2", 7, '{"source":["app.orders","app.invoices"]}')
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_update_dropping_every_setting_fails(cfn, eb):
+    """An update that leaves none of Description, RetentionDays and EventPattern
+    is refused by the handler, and the archive keeps its settings."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-drop-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        named = f"cfn-archive-{uid}"
+        cfn.update_stack(StackName=stack_name,
+                         TemplateBody=_cfn_archive_template(uid, {"ArchiveName": named}))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert any('Resource handler returned message: "Invalid request provided: At least one of '
+                   'EventPattern, RetentionDays or Description must be provided."' in reason
+                   for reason in _stack_failure_reasons(cfn, stack_name))
+        archive = _describe_archive(eb, named)
+        assert (archive["Description"], archive["RetentionDays"]) == ("v1", 3)
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_rollback_to_no_settings_fails(cfn, eb):
+    """Rolling back an in-place update to a template with no Description,
+    RetentionDays or EventPattern meets the same handler refusal, so the stack
+    ends UPDATE_ROLLBACK_FAILED and the archive keeps the update's value."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-rb-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        generated = _output(stack, "UnnamedRef")
+        body = json.loads(_cfn_archive_template(uid, _cfn_archive_props(uid)))
+        body["Resources"]["Unnamed"]["Properties"]["RetentionDays"] = 5
+        body["Resources"]["Bad"] = {"Type": "AWS::SSM::Parameter", "DependsOn": "Unnamed",
+                                    "Properties": {"Type": "Bogus", "Value": "v"}}
+        cfn.update_stack(StackName=stack_name, TemplateBody=json.dumps(body))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_FAILED"
+        assert any('At least one of EventPattern, RetentionDays or Description must be provided.' in reason
+                   for reason in _stack_failure_reasons(cfn, stack_name))
+        assert _describe_archive(eb, generated)["RetentionDays"] == 5
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_rename_replaces_it(cfn, eb):
+    """A new ArchiveName creates a new archive with the template's settings
+    and deletes the old one."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-ren-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        renamed = f"cfn-archive-renamed-{uid}"
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(
+            uid, _cfn_archive_props(uid, name=renamed)))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        assert _output(stack, "NamedRef") == renamed
+        assert _output(stack, "NamedArn").endswith(f":archive/{renamed}")
+        assert _describe_archive(eb, renamed)["Description"] == "v1"
+        left = {a["ArchiveName"] for a in eb.list_archives()["Archives"]}
+        assert f"cfn-archive-{uid}" not in left
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_new_source_on_a_custom_name_is_refused(cfn, eb):
+    """A new SourceArn needs a new archive, which a kept custom name cannot get."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-src-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "CREATE_COMPLETE"
+        named = f"cfn-archive-{uid}"
+        moved = {**_cfn_archive_props(uid), "SourceArn": {"Fn::GetAtt": ["Bus2", "Arn"]}}
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(uid, moved))
+        assert _wait_stack(cfn, stack_name)["StackStatus"] == "UPDATE_ROLLBACK_COMPLETE"
+        assert any("CloudFormation cannot update a stack when a custom-named resource requires "
+                   f"replacing. Rename {named} and update the stack again." in reason
+                   for reason in _stack_failure_reasons(cfn, stack_name))
+        bus_arn = eb.describe_event_bus(Name=f"cfn-archive-bus-{uid}")["Arn"]
+        assert _describe_archive(eb, named)["EventSourceArn"] == bus_arn
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_events_archive_new_source_replaces_a_generated_one(cfn, eb):
+    """A generated archive given a new SourceArn is replaced under a new name."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    stack_name = f"cfn-archive-gsrc-{uid}"
+    cfn.create_stack(StackName=stack_name,
+                     TemplateBody=_cfn_archive_template(uid, _cfn_archive_props(uid)))
+    try:
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        before = _output(stack, "UnnamedRef")
+        cfn.update_stack(StackName=stack_name, TemplateBody=_cfn_archive_template(
+            uid, _cfn_archive_props(uid), generated_bus="Bus2"))
+        stack = _wait_stack(cfn, stack_name)
+        assert stack["StackStatus"] == "UPDATE_COMPLETE", stack.get("StackStatusReason")
+        after = _output(stack, "UnnamedRef")
+        assert after != before and re.fullmatch(r"Unnamed-[A-Za-z0-9]{12}", after)
+        bus2_arn = eb.describe_event_bus(Name=f"cfn-archive-bus2-{uid}")["Arn"]
+        assert _describe_archive(eb, after)["EventSourceArn"] == bus2_arn
+        assert before not in {a["ArchiveName"] for a in eb.list_archives()["Archives"]}
+    finally:
+        _delete_cfn_test_stack(cfn, stack_name)
+
+
 @pytest.mark.parametrize("rollback", [False, True])
 def test_cfn_logs_metric_filter_updates_in_place(cfn, logs, rollback):
     """FilterPattern and MetricTransformations change on the existing filter,

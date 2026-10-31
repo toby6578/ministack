@@ -692,6 +692,7 @@ _CUSTOM_NAME_REPLACEMENT = {
     # Domain is required, so a pool move under the same Domain fails on the
     # name, as the replacement's CreateUserPoolDomain does.
     "AWS::Cognito::UserPoolDomain": {"name": "Domain", "exists": "Domain already exists"},
+    "AWS::Events::Archive": {"name": "ArchiveName"},
     "AWS::Pipes::Pipe": {
         "name": "Name",
         "requires_replacement": _requires_replacement_pipes,
@@ -4399,6 +4400,64 @@ def _eb_event_bus_delete(physical_id, props):
         return
     _eb._delete_event_bus({"Name": physical_id})
 
+
+
+# --- EventBridge Archive ---
+
+_EB_ARCHIVE_SETTINGS = ("Description", "EventPattern", "RetentionDays")
+
+
+def _eb_archive_settings(props):
+    """The archive settings the template sets, in the API's shapes."""
+    data = {}
+    if "Description" in props:
+        data["Description"] = props["Description"]
+    if "EventPattern" in props:
+        # Compact, with non-ASCII characters as written, as DescribeArchive returns
+        # it. A string is not a pattern object: AWS refuses it at validation, and
+        # here the service's own pattern check refuses its JSON string.
+        data["EventPattern"] = json.dumps(props["EventPattern"], separators=(",", ":"), ensure_ascii=False)
+    if "RetentionDays" in props:
+        data["RetentionDays"] = int(props["RetentionDays"])
+    if props.get("KmsKeyIdentifier"):
+        data["KmsKeyIdentifier"] = props["KmsKeyIdentifier"]
+    return data
+
+
+def _eb_archive_attrs(name):
+    return {"Arn": _eb._archives[name]["ArchiveArn"]}
+
+
+def _eb_archive_create(logical_id, props, stack_name):
+    """Ref is the archive name. A generated name is the logical id, cut to 35
+    characters, then - and 12 random letters and digits: 48, the API's limit."""
+    suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    name = props.get("ArchiveName") or f"{logical_id[:35]}-{suffix}"
+    resp = _eb._create_archive({
+        "ArchiveName": name,
+        "EventSourceArn": props.get("SourceArn", ""),
+        **_eb_archive_settings(props),
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Events::Archive create failed: {resp[2]!r}")
+    return name, _eb_archive_attrs(name)
+
+
+def _eb_archive_update(physical_id, old_props, new_props, stack_name):
+    if not any(key in new_props for key in _EB_ARCHIVE_SETTINGS):
+        raise ValueError(
+            'Resource handler returned message: "Invalid request provided: At least one of '
+            'EventPattern, RetentionDays or Description must be provided." '
+            f"(RequestToken: {new_uuid()}, HandlerErrorCode: InvalidRequest)")
+    resp = _eb._update_archive({"ArchiveName": physical_id, **_eb_archive_settings(new_props)})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Events::Archive update failed: {resp[2]!r}")
+    return physical_id, _eb_archive_attrs(physical_id)
+
+
+def _eb_archive_delete(physical_id, props):
+    if physical_id in _eb._archives:
+        _eb._delete_archive({"ArchiveName": physical_id})
 
 
 # --- Kinesis Stream ---
@@ -15006,6 +15065,7 @@ def _location_tracker_delete(physical_id, props):
 
 # Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "AWS::Events::Archive": ("ArchiveName", "SourceArn"),
     "AWS::DocDB::DBCluster": ("AvailabilityZones", "DBClusterIdentifier", "DBSubnetGroupName", "KmsKeyId",
                               "MasterUsername", "SnapshotIdentifier", "SourceDBClusterIdentifier",
                               "StorageEncrypted"),
@@ -15431,6 +15491,7 @@ _RESOURCE_HANDLERS = {
         "delete": _cwlogs_metric_filter_delete,
     },
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "update": _eb_event_bus_update, "delete": _eb_event_bus_delete},
+    "AWS::Events::Archive": {"create": _eb_archive_create, "update": _eb_archive_update, "delete": _eb_archive_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "update": _kinesis_stream_update, "delete": _kinesis_stream_delete},
     "AWS::Events::Rule": {
         "create": _eb_rule_create,

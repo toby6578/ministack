@@ -1138,6 +1138,22 @@ def test_eventbridge_archive(eb):
     assert not any(a["ArchiveName"] == archive_name for a in archives2["Archives"])
 
 
+def test_eventbridge_archive_without_description_or_pattern_has_neither(eb):
+    import uuid as _uuid
+
+    archive_name = f"intg-archive-nodesc-{_uuid.uuid4().hex[:8]}"
+    eb.create_archive(
+        ArchiveName=archive_name,
+        EventSourceArn="arn:aws:events:us-east-1:000000000000:event-bus/default",
+    )
+    try:
+        desc = eb.describe_archive(ArchiveName=archive_name)
+        assert "Description" not in desc and "EventPattern" not in desc
+        assert desc["RetentionDays"] == 0
+    finally:
+        eb.delete_archive(ArchiveName=archive_name)
+
+
 def test_eventbridge_endpoints_and_partner_stubs(eb):
     eb.create_endpoint(
         Name="my-global-endpoint",
